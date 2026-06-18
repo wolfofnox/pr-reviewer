@@ -779,6 +779,45 @@ def review_project(project_id: str, request: ReviewRequest):
                 "search_hits": aggregated_hits
             })
 
+    # Final pass: synthesize a human-readable overall review from findings
+    def _summarize_findings(findings_list, model_name, openai_client):
+        if not findings_list:
+            return "No findings detected."
+        # build a compact representation for the prompt
+        items = []
+        for f in findings_list[:40]:
+            review = f.get("review") or ""
+            review_snip = (review[:800] + "...") if len(review) > 800 else review
+            items.append(f"File: {f.get('file')}\nSymbol: {f.get('symbol')}\nReview: {review_snip}")
+        payload = "\n\n".join(items)
+
+        prompt = (
+            "You are an expert senior software engineer. Convert the following raw review findings into a clear, human-friendly code review summary. "
+            "Group issues by file, highlight severity (Critical/High/Medium/Low), and provide actionable suggestions. Keep it concise and readable.\n\n"
+            f"Raw findings:\n{payload}\n\nSummary:\n"
+        )
+
+        try:
+            resp = openai_client.chat.completions.create(
+                model=model_name,
+                messages=[
+                    {"role": "system", "content": "You are a senior software engineer and code reviewer."},
+                    {"role": "user", "content": prompt}
+                ],
+                max_tokens=800
+            )
+            summary = None
+            if hasattr(resp, "choices") and len(resp.choices) > 0:
+                summary = resp.choices[0].message.content if resp.choices[0].message else None
+            if not summary:
+                summary = getattr(resp, "text", None) or str(resp)
+            return summary
+        except Exception as e:
+            logger.exception("Failed to synthesize summary: %s", e)
+            return f"(summary generation failed: {e})"
+
+    summary_text = _summarize_findings(findings, chat_model, openai_client)
+
     # cleanup temporary collections
     try:
         chroma_client.delete_collection(name=base_col)
@@ -789,4 +828,4 @@ def review_project(project_id: str, request: ReviewRequest):
     except Exception:
         pass
 
-    return {"findings": findings}
+    return {"summary": summary_text, "findings": findings}
