@@ -540,6 +540,8 @@ def review_project(project_id: str, request: ReviewRequest):
         pr_obj = repo.get_pull(request.pr)
         base_sha = pr_obj.base.sha
         head_sha = pr_obj.head.sha
+        # map PR files for patch access
+        pr_files_map = {f.filename: f for f in pr_obj.get_files()}
     except Exception as e:
         logger.exception("Failed to load PR info: %s", e)
         raise HTTPException(status_code=500, detail=f"failed to load PR {request.pr}: {e}")
@@ -635,6 +637,71 @@ def review_project(project_id: str, request: ReviewRequest):
             return [{"name": "<file>", "code": text}]
         return chunks
 
+    def extract_added_blocks_from_patch(patch: str) -> list:
+        """Return a list of added-text blocks from a unified diff patch (lines starting with '+', excluding headers)."""
+        if not patch:
+            return []
+        added_blocks = []
+        cur = []
+        for ln in patch.splitlines():
+            if ln.startswith('+++') or ln.startswith('---') or ln.startswith('@@'):
+                # diff metadata; treat as boundary
+                if cur:
+                    added_blocks.append('\n'.join(cur))
+                    cur = []
+                continue
+            if ln.startswith('+') and not ln.startswith('+++'):
+                cur.append(ln[1:])
+            else:
+                if cur:
+                    added_blocks.append('\n'.join(cur))
+                    cur = []
+        if cur:
+            added_blocks.append('\n'.join(cur))
+        return added_blocks
+
+    def get_changed_symbols_for_file(file_path: str, base_text: str, head_text: str, pr_files_map: dict):
+        """Return list of symbol dicts (name, code) that changed in this file using the PR patch when available."""
+        # try to find the PR file entry
+        pf = pr_files_map.get(file_path)
+        if pf is None:
+            # no patch available; fallback to any symbols in head_text
+            return split_symbols(head_text)
+
+        # if file was removed, nothing to review
+        if getattr(pf, 'status', None) == 'removed':
+            return []
+
+        patch = getattr(pf, 'patch', None)
+        if not patch:
+            # for added files, review all symbols in head
+            if getattr(pf, 'status', None) == 'added':
+                return split_symbols(head_text)
+            return split_symbols(head_text)
+
+        added_blocks = extract_added_blocks_from_patch(patch)
+        symbols = []
+        for block in added_blocks:
+            # find symbols inside added block
+            syms = split_symbols(block)
+            for s in syms:
+                # avoid duplicates by name+code
+                key = (s.get('name'), s.get('code'))
+                symbols.append(s)
+        # If no symbols found in added hunks and file was added, include all head symbols
+        if not symbols and getattr(pf, 'status', None) == 'added':
+            return split_symbols(head_text)
+        # dedupe by name+code while preserving order
+        seen = set()
+        unique = []
+        for s in symbols:
+            k = (s.get('name'), s.get('code'))
+            if k in seen:
+                continue
+            seen.add(k)
+            unique.append(s)
+        return unique
+
     findings = []
 
     # prepare OpenAI client for review prompts
@@ -657,9 +724,11 @@ def review_project(project_id: str, request: ReviewRequest):
     for ch in changed:
         path = ch["path"]
         head_text = ch["head"]
-        symbols = split_symbols(head_text)
+        symbols = get_changed_symbols_for_file(path, ch.get("base", ""), head_text, pr_files_map)
         if not symbols:
-            symbols = [{"name": "<file>", "code": head_text}]
+            logger.info("No changed symbols found in file %s, skipping", path)
+            continue
+        logger.info("Found %d changed symbols in file %s", len(symbols), path)
 
         for sym in symbols:
             sym_name = sym.get("name")
