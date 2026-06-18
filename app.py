@@ -11,7 +11,8 @@ import tempfile
 import shutil
 import requests
 import logging
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
+from collections import deque
 import openai
 from openai import OpenAI
 import chromadb
@@ -59,7 +60,7 @@ class QueryRequest(BaseModel):
     prompt: str
     top_k: int = 5
     model: str | None = None
-
+    
 # -------------------------
 # Utils
 # -------------------------
@@ -277,6 +278,109 @@ def index_dir(path: str, collection_id: str, model: str = "text-embedding-3-smal
 
     return {"last_refresh": datetime.now().isoformat(), "indexed_chunks": total}
 
+
+def _extract_text_from_html(html: str) -> str:
+    # remove script/style
+    html = re.sub(r"(?is)<script.*?>.*?</script>", "", html)
+    html = re.sub(r"(?is)<style.*?>.*?</style>", "", html)
+    # remove tags
+    text = re.sub(r"(?s)<[^>]+>", " ", html)
+    # unescape HTML entities
+    try:
+        from html import unescape
+        text = unescape(text)
+    except Exception:
+        pass
+    # collapse whitespace
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def fetch_and_index_docs(project_id: str, base_url: str, max_pages: int = 50, embeddings_model: str = "text-embedding-3-small") -> dict:
+    """Crawl pages under base_url (same netloc) up to max_pages and index into Chroma collection named project_id."""
+    if not base_url:
+        raise HTTPException(status_code=400, detail="base_url required")
+
+    parsed = urlparse(base_url)
+    base_netloc = parsed.netloc
+
+    visited = set()
+    to_visit = deque([base_url])
+    pages = []
+
+    session = requests.Session()
+    session.headers.update({"User-Agent": "pr-reviewer-bot/1.0"})
+
+    while to_visit and len(visited) < max_pages:
+        url = to_visit.popleft()
+        if url in visited:
+            continue
+        try:
+            resp = session.get(url, timeout=10)
+            resp.raise_for_status()
+            html = resp.text
+        except Exception as e:
+            logger.debug("Failed to fetch %s: %s", url, e)
+            visited.add(url)
+            continue
+
+        visited.add(url)
+        text = _extract_text_from_html(html)
+        if text:
+            pages.append({"url": url, "text": text})
+
+        # find links
+        for href in re.findall(r'href=["\'](.*?)["\']', html):
+            next_url = urljoin(url, href)
+            np = urlparse(next_url)
+            if np.scheme.startswith("http") and np.netloc == base_netloc:
+                # normalize
+                norm = np.scheme + "://" + np.netloc + np.path
+                if norm not in visited and norm not in to_visit:
+                    to_visit.append(norm)
+
+    # prepare collection
+    try:
+        coll = chroma_client.get_collection(name=project_id)
+    except Exception:
+        coll = chroma_client.create_collection(name=project_id)
+
+    # convert pages to chunks and index
+    items = []
+    for p in pages:
+        chunks = chunk_text(p["text"])
+        if not chunks:
+            items.append({"text": p["text"], "meta": {"source": p["url"]}})
+        else:
+            for idx, (chunk, start, end) in enumerate(chunks):
+                items.append({"text": chunk, "meta": {"source": p["url"], "chunk": idx, "start": start, "end": end}})
+
+    # embed & add
+    api_key = OPENAI_API_KEY
+    if not api_key:
+        raise HTTPException(status_code=500, detail="OPENAI_API_KEY not set")
+    openai_client = OpenAI(api_key=api_key)
+
+    batch_size = 256
+    total = 0
+    model = embeddings_model or "text-embedding-3-small"
+    for i in range(0, len(items), batch_size):
+        batch = items[i:i+batch_size]
+        texts = [it["text"] for it in batch]
+        try:
+            resp = openai_client.embeddings.create(input=texts, model=model)
+        except Exception as e:
+            logger.exception("Embedding failed while indexing docs: %s", e)
+            raise HTTPException(status_code=500, detail=f"embedding failed: {e}")
+        embeddings = [r.embedding for r in resp.data]
+        ids = [str(uuid.uuid4()) for _ in batch]
+        metadatas = [it["meta"] for it in batch]
+        coll.add(ids=ids, documents=texts, metadatas=metadatas, embeddings=embeddings)
+        total += len(batch)
+
+    logger.info("Indexed %d doc-chunks for project %s from %s", total, project_id, base_url)
+    return {"indexed_chunks": total, "pages_fetched": len(pages)}
+
 def query_db(collection_id: str, request: str, model: str, top_k: int):
     logger.info("Query requested for collecton %s", collection_id)
 
@@ -361,6 +465,12 @@ def create_project(project: ProjectCreate):
 
     logger.info("Created project %s -> %s", project.name, project_id)
 
+    for doc in metadata.get("docs", []) or []:
+        try:
+            fetch_and_index_docs(project_id, doc, max_pages=50, embeddings_model="text-embedding-3-small")
+        except Exception:
+            logger.exception("Failed to fetch and index docs for %s", doc)
+
     return {
         "status": "completed",
         "project_id": project_id,
@@ -390,8 +500,6 @@ def refresh_project(project_id: str):
         "project_id": project_id,
         "status": "completed"
     }
-
-
 
 @app.get("/api/projects/{project_id}/status")
 def project_status(project_id: str):
