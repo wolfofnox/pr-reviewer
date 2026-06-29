@@ -21,10 +21,10 @@ import chromadb
 PROJECT_ROOT = "/projects"
 
 # GitHub token (used for PyGithub and direct API downloads)
-GITHUB_TOKEN = "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"
+GITHUB_TOKEN = "YOUR_KEY"
 g = Github(GITHUB_TOKEN)
 
-OPENAI_API_KEY = "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"
+OPENAI_API_KEY = "YOUR_KEY"
 
 app = FastAPI(
     title="PR Reviewer API",
