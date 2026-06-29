@@ -81,3 +81,6 @@ Or, if you only want to run the API:
 ```bash
 docker compose up -d pr-reviewer
 ```
+
+## Use your API keys
+Plug in your own API keys for OpenAPI and GitHub
