@@ -13,6 +13,7 @@ import requests
 import logging
 from urllib.parse import urlparse, urljoin
 from collections import deque
+import re
 import openai
 from openai import OpenAI
 import chromadb
@@ -487,8 +488,11 @@ def refresh_project(project_id: str):
         raise HTTPException(status_code=404, detail=f"project '{project_id}' not found")
 
     try:
-        logger.warning("Proj refresh: Not implemented")
-        raise HTTPException(status_code=501, detail="Project refreshing not implemented")
+        for doc in metadata.get("docs", []) or []:
+            try:
+                fetch_and_index_docs(project_id, doc, max_pages=50, embeddings_model="text-embedding-3-small")
+            except Exception:
+                logger.exception("Failed to fetch and index docs for %s", doc)
     except Exception as e:
         logger.exception("Refresh failed for project %s: %s", project_id, str(e))
         return {"project_id": project_id, "status": "error", "message": str(e)}
@@ -610,6 +614,11 @@ def review_project(project_id: str, request: ReviewRequest):
     import re
 
     def split_symbols(text: str):
+        """Split text into symbol chunks and record start/end line numbers.
+
+        Returns a list of dicts: {name, code, start_line, end_line}.
+        Also emits debug logs showing the symbol name and its line range.
+        """
         if not text:
             return [{"name": "<empty>", "code": ""}]
         lines = text.splitlines(keepends=True)
@@ -617,23 +626,34 @@ def review_project(project_id: str, request: ReviewRequest):
         chunks = []
         cur_name = None
         cur_lines = []
+        cur_start = None
+        line_no = 1
         for ln in lines:
             m = pattern.match(ln)
             if m:
-                # flush
                 if cur_name is not None:
-                    chunks.append({"name": cur_name, "code": "".join(cur_lines)})
+                    end_line = line_no - 1
+                    code = "".join(cur_lines)
+                    chunks.append({"name": cur_name, "code": code, "start_line": cur_start, "end_line": end_line})
+                    logger.debug("split_symbols: name=%s start=%d end=%d", cur_name, cur_start, end_line)
                 cur_name = m.group(2)
                 cur_lines = [ln]
+                cur_start = line_no
             else:
                 if cur_name is None:
                     cur_name = "<top>"
                     cur_lines = [ln]
+                    cur_start = line_no
                 else:
                     cur_lines.append(ln)
+            line_no += 1
         if cur_name is not None:
-            chunks.append({"name": cur_name, "code": "".join(cur_lines)})
+            end_line = line_no - 1
+            code = "".join(cur_lines)
+            chunks.append({"name": cur_name, "code": code, "start_line": cur_start, "end_line": end_line})
+            logger.debug("split_symbols: name=%s start=%d end=%d", cur_name, cur_start, end_line)
         if not chunks:
+            logger.debug("no symbols found, returning entire text")
             return [{"name": "<file>", "code": text}]
         return chunks
 
@@ -681,7 +701,9 @@ def review_project(project_id: str, request: ReviewRequest):
 
         added_blocks = extract_added_blocks_from_patch(patch)
         symbols = []
+        logger.info("Found %d added blocks in file %s", len(added_blocks), path)
         for block in added_blocks:
+            logger.debug("New block:")
             # find symbols inside added block
             syms = split_symbols(block)
             for s in syms:
